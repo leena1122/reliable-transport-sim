@@ -20,25 +20,33 @@ class Streamer:
         self.dst_port = dst_port
         # maximum udp payload size to be able to fit 1472 byte limit
         self.max_size = 1400 # leave room for header
-
-        self.send_seq_num = 0 
+        
+        # Sequence number management
+        self.send_base = 0  # first unacked packet
+        self.next_seq_num = 0  # next sequence number to use
         self.receive_seq_num = 0
+        self.window_size = 5  # number of packets that can be in flight
+        self.send_buffer = {}  # store packets that might need retransmission
         self.receive_buffer = defaultdict(bytes)
+        
         # header format: sequence number (I), packet type (B), and hash (32s)
         self.header_form = "!IB32s"  # Added B for packet type, 32s for MD5 hash
         self.header_size = struct.calcsize(self.header_form)
-
+        
         # thread stuff
         self.closed = False
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.executor.submit(self.listener)
-
+        
         # ACK and connection management
         self.ack_received = False
         self.waiting_for_seq = None
         self.ACK_TIMEOUT = 0.25
         self.fin_received = False
         self.fin_acked = False
+
+        self.last_retransmit = 0
+        self.RETRANSMIT_INTERVAL = 0.25
 
         # packet types
         self.DATA_PACKET = 0
@@ -48,6 +56,21 @@ class Streamer:
     def compute_hash(self, seq_num: int, packet_type: int, data: bytes) -> bytes:
         header_without_md5 = struct.pack("!IB", seq_num, packet_type)
         return hashlib.md5(header_without_md5 + data).hexdigest().encode('ascii')
+
+    def create_packet(self, seq_num: int, packet_type: int, data: bytes) -> bytes:
+        hashed_val = self.compute_hash(seq_num, packet_type, data)
+        header = struct.pack(self.header_form, seq_num, packet_type, hashed_val)
+        return header + data
+
+    def handle_timeout(self):
+        """Retransmit all unacked packets in the window"""
+        current_time = time.time()
+        if current_time - self.last_retransmit >= self.RETRANSMIT_INTERVAL:
+            for seq_num in range(self.send_base, self.next_seq_num):
+                if seq_num in self.send_buffer:
+                    self.socket.sendto(self.send_buffer[seq_num], 
+                                       (self.dst_ip, self.dst_port))
+            self.last_retransmit = current_time
 
     def listener(self):
         while not self.closed:
@@ -60,6 +83,7 @@ class Streamer:
                 header = segment[:self.header_size]
                 data = segment[self.header_size:]
                 seq_num, packet_type, received_hash = struct.unpack(self.header_form, header)
+                
 
                 # for the packets, check that the hash is right before processing
                 if packet_type == self.DATA_PACKET:
@@ -68,24 +92,29 @@ class Streamer:
                     if computed_hash != received_hash:
                         # has doesn't match, the packet is corrupted and will be disacrded
                         continue  # skip the packet, it will be retransmitted
-
+                    
                     # if correct, store and ACK
                     self.receive_buffer[seq_num] = data
-                    ack_header = self.make_header(seq_num, self.ACK_PACKET, b'')  # no data
+                    hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')  # no data
+                    ack_header = struct.pack(self.header_form, seq_num, self.ACK_PACKET, hashed_val)
                     self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
-
-                elif packet_type == self.ACK_PACKET:
+                
+                elif packet_type == self.ACK_PACKET:  
                     # handle received ACK
-                    if seq_num == self.waiting_for_seq:
-                        self.ack_received = True
-
+                    if seq_num >= self.send_base:  # update send window
+                        self.send_base = seq_num + 1
+                        # Remove acknowledged packets from buffer
+                        keys_to_remove = [k for k in self.send_buffer.keys() if k <= seq_num]
+                        for k in keys_to_remove:
+                            del self.send_buffer[k]
+                
                 elif packet_type == self.FIN_PACKET:
                     # handle received FIN
                     self.fin_received = True
                     # send ACK for FIN
-                    ack_header = self.make_header(seq_num, self.ACK_PACKET, b'')
-                    #ack_header = struct.pack(self.header_form, seq_num, self.ACK_PACKET)
-                    self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
+                    hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')
+                    ack_packet = struct.pack(self.header_form, seq_num, self.ACK_PACKET, hashed_val)
+                    self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
 
                 else: # unknown type, discard
                     continue
@@ -94,11 +123,6 @@ class Streamer:
                 if not self.closed:
                     print("listener died!")
                     print(e)
-
-    def make_header(self, seq_num: int, packet_type: int, data: bytes) -> bytes:
-        """Build a header with an MD5 that covers (seq_num, packet_type, data)."""
-        md5_val = self.compute_hash(seq_num, packet_type, data)
-        return struct.pack(self.header_form, seq_num, packet_type, md5_val)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
@@ -109,45 +133,34 @@ class Streamer:
             max_data = self.max_size - self.header_size
             end = min(offset + max_data, len(data_bytes))
             chunk = data_bytes[offset:end]
-
-            # keep trying until ACK received
-            while True:
-                # segment w seq number, packet type, and chunk
-                header = self.make_header(self.send_seq_num, self.DATA_PACKET, chunk)
-                #header = struct.pack(self.header_form, self.send_seq_num, self.DATA_PACKET) #, chunk)
-                # segment w seq number and packet type
-                segment = header + chunk
-
-                # send the chunk
-                self.socket.sendto(segment, (self.dst_ip, self.dst_port))
-
-                # Wait for ACK with timeout
-                self.waiting_for_seq = self.send_seq_num
-                self.ack_received = False
-                start_time = time.time()
-
-                while time.time() - start_time < self.ACK_TIMEOUT:
-                    if self.ack_received:
-                        break
-                    time.sleep(0.01)
-
-                if self.ack_received:
-                    break
-                # if no ACK received, retry the send
-
-            # move to next chunk + update seq number
-            self.send_seq_num += 1
+            
+            # wait if window is full
+            while self.next_seq_num >= self.send_base + self.window_size: ##
+                self.handle_timeout() ##
+                time.sleep(0.01) ##
+            
+            # send the packet
+            hashed_val = self.compute_hash(self.next_seq_num, self.DATA_PACKET, chunk)
+            header = struct.pack(self.header_form, self.next_seq_num, self.DATA_PACKET, hashed_val)
+            segment = header + chunk
+            self.socket.sendto(segment, (self.dst_ip, self.dst_port))
+      
+            # store in send buffer and update sequence number
+            self.send_buffer[self.next_seq_num] = header
+            self.next_seq_num += 1
             offset = end
+            
+            # check for timeouts
+            self.handle_timeout()
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
         while True:
             # check if its the correct sequential seq number in buffer
             # if its the next packet in the buffer, return it
-            current_seq = self.receive_seq_num
-            if current_seq in self.receive_buffer:
-                data = self.receive_buffer[current_seq]
-                del self.receive_buffer[current_seq]
+            if self.receive_seq_num in self.receive_buffer:
+                data = self.receive_buffer[self.receive_seq_num]
+                del self.receive_buffer[self.receive_seq_num]
                 self.receive_seq_num += 1
                 return data
             
@@ -160,27 +173,28 @@ class Streamer:
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
-        # send FIN until ACKed
+        # wait for all data to be ACK ed
+        while self.send_base < self.next_seq_num:
+            self.handle_timeout()
+            time.sleep(0.01)
+        
+        # send FIN packet, let it be ACK ed
+        fin_seq = self.next_seq_num
         while not self.fin_acked:
-            # send FIN packet
-            fin_header = self.make_header(self.send_seq_num, self.FIN_PACKET, b'')
-            #fin_header = struct.pack(self.header_form, self.send_seq_num, self.FIN_PACKET)
-            self.socket.sendto(fin_header, (self.dst_ip, self.dst_port))
-
-            # wait for ACK
-            self.waiting_for_seq = self.send_seq_num
-            self.ack_received = False
+            fin_packet = self.create_packet(fin_seq, self.FIN_PACKET, b'')
+            self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
+            
+            # Wait for ACK with timeout
             start_time = time.time()
-
             while time.time() - start_time < self.ACK_TIMEOUT:
-                if self.ack_received:
+                if self.send_base > fin_seq:
                     self.fin_acked = True
                     break
                 time.sleep(0.01)
-
-            if self.fin_acked: ##
-                break ##
-
+            
+            if self.fin_acked:
+                break
+        
         # wait for FIN from other side
         wait_start = time.time()
         while not self.fin_received and time.time() - wait_start < 2.0:
