@@ -57,11 +57,6 @@ class Streamer:
         header_without_md5 = struct.pack("!IB", seq_num, packet_type)
         return hashlib.md5(header_without_md5 + data).hexdigest().encode('ascii')
 
-    def create_packet(self, seq_num: int, packet_type: int, data: bytes) -> bytes:
-        hashed_val = self.compute_hash(seq_num, packet_type, data)
-        header = struct.pack(self.header_form, seq_num, packet_type, hashed_val)
-        return header + data
-
     def handle_timeout(self):
         """Retransmit all unacked packets in the window"""
         current_time = time.time()
@@ -146,7 +141,7 @@ class Streamer:
             self.socket.sendto(segment, (self.dst_ip, self.dst_port))
       
             # store in send buffer and update sequence number
-            self.send_buffer[self.next_seq_num] = header
+            self.send_buffer[self.next_seq_num] = segment
             self.next_seq_num += 1
             offset = end
             
@@ -181,7 +176,8 @@ class Streamer:
         # send FIN packet, let it be ACK ed
         fin_seq = self.next_seq_num
         while not self.fin_acked:
-            fin_packet = self.create_packet(fin_seq, self.FIN_PACKET, b'')
+            hashed_val = self.compute_hash(fin_seq, self.FIN_PACKET, b'')
+            fin_packet = struct.pack(self.header_form, fin_seq, self.FIN_PACKET, hashed_val)
             self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
             
             # Wait for ACK with timeout
