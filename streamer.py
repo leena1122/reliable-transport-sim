@@ -21,14 +21,14 @@ class Streamer:
         # maximum udp payload size to be able to fit 1472 byte limit
         self.max_size = 1400 # leave room for header
         
-        # Sequence number management
-        self.send_base = 0  # first unacked packet
-        self.next_seq_num = 0  # next sequence number to use
+        # sequence number management
+        self.send_base = 0
+        self.next_seq_num = 0
         self.receive_seq_num = 0
-        self.window_size = 5  # number of packets that can be in flight
-        self.send_buffer = {}  # store packets that might need retransmission
+        self.window_size = 5
+        self.send_buffer = {}
         self.receive_buffer = defaultdict(bytes)
-        
+
         # header format: sequence number (I), packet type (B), and hash (32s)
         self.header_form = "!IB32s"  # Added B for packet type, 32s for MD5 hash
         self.header_size = struct.calcsize(self.header_form)
@@ -41,17 +41,22 @@ class Streamer:
         # ACK and connection management
         self.ack_received = False
         self.waiting_for_seq = None
-        self.ACK_TIMEOUT = 0.25
+        self.ACK_TIMEOUT = 0.1  # faster retransmission
         self.fin_received = False
         self.fin_acked = False
+        self.fin_sent = False
+        self.all_data_acked = False
 
         self.last_retransmit = 0
-        self.RETRANSMIT_INTERVAL = 0.25
-
+        self.RETRANSMIT_INTERVAL = 0.1  # more retransmission
+        
         # packet types
         self.DATA_PACKET = 0
         self.ACK_PACKET = 1
         self.FIN_PACKET = 2
+        
+        self.MAX_RETRANSMIT_ATTEMPTS = 50
+        self.retransmit_attempts = 0
 
     def compute_hash(self, seq_num: int, packet_type: int, data: bytes) -> bytes:
         header_without_md5 = struct.pack("!IB", seq_num, packet_type)
@@ -78,7 +83,6 @@ class Streamer:
                 header = segment[:self.header_size]
                 data = segment[self.header_size:]
                 seq_num, packet_type, received_hash = struct.unpack(self.header_form, header)
-                
 
                 # for the packets, check that the hash is right before processing
                 if packet_type == self.DATA_PACKET:
@@ -87,7 +91,7 @@ class Streamer:
                     if computed_hash != received_hash:
                         # has doesn't match, the packet is corrupted and will be disacrded
                         continue  # skip the packet, it will be retransmitted
-                    
+
                     # if correct, store and ACK
                     self.receive_buffer[seq_num] = data
                     hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')  # no data
@@ -98,18 +102,24 @@ class Streamer:
                     # handle received ACK
                     if seq_num >= self.send_base:  # update send window
                         self.send_base = seq_num + 1
-                        # Remove acknowledged packets from buffer
+                        self.retransmit_attempts = 0  # reset the attempts on the case of asuccessful ACK
                         keys_to_remove = [k for k in self.send_buffer.keys() if k <= seq_num]
                         for k in keys_to_remove:
                             del self.send_buffer[k]
+
+                        if self.fin_sent and seq_num == self.next_seq_num - 1:
+                            self.fin_acked = True
+                        if self.send_base == self.next_seq_num:
+                            self.all_data_acked = True
                 
                 elif packet_type == self.FIN_PACKET:
                     # handle received FIN
                     self.fin_received = True
                     # send ACK for FIN
-                    hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')
-                    ack_packet = struct.pack(self.header_form, seq_num, self.ACK_PACKET, hashed_val)
-                    self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
+                    for _ in range(5):  # send more ACKs for FIN
+                        hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')
+                        ack_packet = struct.pack(self.header_form, seq_num, self.ACK_PACKET, hashed_val)
+                        self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
 
                 else: # unknown type, discard
                     continue
@@ -149,10 +159,7 @@ class Streamer:
             self.handle_timeout()
 
     def recv(self) -> bytes:
-        """Blocks (waits) if no data is ready to be read from the connection."""
         while True:
-            # check if its the correct sequential seq number in buffer
-            # if its the next packet in the buffer, return it
             if self.receive_seq_num in self.receive_buffer:
                 data = self.receive_buffer[self.receive_seq_num]
                 del self.receive_buffer[self.receive_seq_num]
@@ -162,44 +169,41 @@ class Streamer:
             if self.fin_received and not self.receive_buffer:
                 return b''
             
-            # otherwise wait a bit and check again
             time.sleep(0.01)
 
     def close(self) -> None:
-        """Cleans up. It should block (wait) until the Streamer is done with all
-           the necessary ACKs and retransmissions"""
-        # wait for all data to be ACK ed
+        # Wait for all data to be ACKed
+        close_start_time = time.time()
         while self.send_base < self.next_seq_num:
+            if time.time() - close_start_time > 5.0:  # 5 second timeout
+                break
             self.handle_timeout()
             time.sleep(0.01)
         
-        # send FIN packet, let it be ACK ed
+        # Send FIN
+        self.fin_sent = True
         fin_seq = self.next_seq_num
-        while not self.fin_acked:
-            hashed_val = self.compute_hash(fin_seq, self.FIN_PACKET, b'')
-            fin_packet = struct.pack(self.header_form, fin_seq, self.FIN_PACKET, hashed_val)
-            self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
-            
-            # Wait for ACK with timeout
-            start_time = time.time()
-            while time.time() - start_time < self.ACK_TIMEOUT:
-                if self.send_base > fin_seq:
-                    self.fin_acked = True
-                    break
-                time.sleep(0.01)
-            
-            if self.fin_acked:
-                break
+        hashed_val = self.compute_hash(fin_seq, self.FIN_PACKET, b'')
+        fin_packet = struct.pack(self.header_form, fin_seq, self.FIN_PACKET, hashed_val)
+        self.next_seq_num += 1
         
-        # wait for FIN from other side
+        # Keep sending FIN until ACKed
+        fin_start_time = time.time()
+        while not self.fin_acked:
+            if time.time() - fin_start_time > 5.0:  # 5 second timeout
+                break
+            # Send FIN multiple times
+            for _ in range(3):
+                self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
+            time.sleep(self.ACK_TIMEOUT)
+        
+        # Wait for FIN from other side
         wait_start = time.time()
         while not self.fin_received and time.time() - wait_start < 2.0:
             time.sleep(0.01)
-
-        # wait 2 seconds
-        time.sleep(2.0)
-
-        # clean up
+        
+        # Final cleanup
+        time.sleep(0.2)  # Slightly longer delay to ensure last ACKs are processed
         self.closed = True
         self.socket.stoprecv()
         self.executor.shutdown(wait=True)
