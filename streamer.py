@@ -172,38 +172,38 @@ class Streamer:
             time.sleep(0.01)
 
     def close(self) -> None:
-        # Wait for all data to be ACKed
+        # wait for all data to be ACKed
         close_start_time = time.time()
         while self.send_base < self.next_seq_num:
-            if time.time() - close_start_time > 5.0:  # 5 second timeout
+            if time.time() - close_start_time > 5.0:  # 5 seconds
                 break
             self.handle_timeout()
             time.sleep(0.01)
         
-        # Send FIN
+        # send FIN
         self.fin_sent = True
         fin_seq = self.next_seq_num
         hashed_val = self.compute_hash(fin_seq, self.FIN_PACKET, b'')
         fin_packet = struct.pack(self.header_form, fin_seq, self.FIN_PACKET, hashed_val)
         self.next_seq_num += 1
         
-        # Keep sending FIN until ACKed
+        # keep sending FIN until ACK ed
         fin_start_time = time.time()
         while not self.fin_acked:
-            if time.time() - fin_start_time > 5.0:  # 5 second timeout
+            if time.time() - fin_start_time > 5.0:  # 5 seconds
                 break
-            # Send FIN multiple times
+            # send FIN mroe times
             for _ in range(3):
                 self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
             time.sleep(self.ACK_TIMEOUT)
         
-        # Wait for FIN from other side
+        # wait for FIN from other side
         wait_start = time.time()
         while not self.fin_received and time.time() - wait_start < 2.0:
             time.sleep(0.01)
         
-        # Final cleanup
-        time.sleep(0.2)  # Slightly longer delay to ensure last ACKs are processed
+        # clean up
+        time.sleep(0.2)  # wait 2 seconds
         self.closed = True
         self.socket.stoprecv()
         self.executor.shutdown(wait=True)
