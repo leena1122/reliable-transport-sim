@@ -66,97 +66,118 @@ class Streamer:
         """Retransmit all unacked packets in the window"""
         current_time = time.time()
         if current_time - self.last_retransmit >= self.RETRANSMIT_INTERVAL:
-            for seq_num in range(self.send_base, self.next_seq_num):
+            self.retransmit_attempts += 1
+            
+            # Only retransmit packets that are actually in our buffer
+            window_start = self.send_base
+            window_end = min(self.next_seq_num, self.send_base + self.window_size)
+            
+            # Safety check to ensure window bounds are valid
+            if window_start > window_end:
+                window_start = max(0, window_end - self.window_size)
+            
+            # Retransmit packets within the current window that exist in our buffer
+            for seq_num in range(window_start, window_end):
                 if seq_num in self.send_buffer:
-                    self.socket.sendto(self.send_buffer[seq_num], 
-                                       (self.dst_ip, self.dst_port))
+                    # Send multiple times based on how long we've been retransmitting
+                    retransmit_count = min(3, self.retransmit_attempts)
+                    for _ in range(retransmit_count):
+                        try:
+                            self.socket.sendto(self.send_buffer[seq_num], 
+                                             (self.dst_ip, self.dst_port))
+                        except Exception as e:
+                            print(f"Error retransmitting packet {seq_num}: {e}")
+            
             self.last_retransmit = current_time
+            
+            # Adjust window size if we're having trouble
+            if self.retransmit_attempts > 10:
+                self.window_size = max(2, self.window_size - 1)  # Reduce window size if having issues
+            elif self.retransmit_attempts > 20:
+                # Reset everything if we're really stuck
+                self.window_size = 2
+                self.send_base = min(self.send_buffer.keys()) if self.send_buffer else self.next_seq_num
+                self.retransmit_attempts = 0
 
     def listener(self):
         while not self.closed:
             try:
                 segment, addr = self.socket.recvfrom()
                 if len(segment) < self.header_size:
-                    continue  # ignore malformed
+                    continue
 
-                # parse out the header
                 header = segment[:self.header_size]
                 data = segment[self.header_size:]
                 seq_num, packet_type, received_hash = struct.unpack(self.header_form, header)
-
-                # for the packets, check that the hash is right before processing
+                
                 if packet_type == self.DATA_PACKET:
-                    # handle data packet
                     computed_hash = self.compute_hash(seq_num, packet_type, data)
                     if computed_hash != received_hash:
-                        # has doesn't match, the packet is corrupted and will be disacrded
-                        continue  # skip the packet, it will be retransmitted
-
-                    # if correct, store and ACK
+                        continue
+                    
                     self.receive_buffer[seq_num] = data
-                    hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')  # no data
+                    # Send ACK multiple times for reliability
+                    hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')
                     ack_header = struct.pack(self.header_form, seq_num, self.ACK_PACKET, hashed_val)
-                    self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
+                    for _ in range(3):
+                        self.socket.sendto(ack_header, (self.dst_ip, self.dst_port))
                 
-                elif packet_type == self.ACK_PACKET:  
-                    # handle received ACK
-                    if seq_num >= self.send_base:  # update send window
-                        self.send_base = seq_num + 1
-                        self.retransmit_attempts = 0  # reset the attempts on the case of asuccessful ACK
-                        keys_to_remove = [k for k in self.send_buffer.keys() if k <= seq_num]
-                        for k in keys_to_remove:
-                            del self.send_buffer[k]
-
+                elif packet_type == self.ACK_PACKET:
+                    if seq_num >= self.send_base:
+                        # Update window more aggressively
+                        old_base = self.send_base
+                        self.send_base = max(seq_num + 1, self.send_base)
+                        self.retransmit_attempts = 0
+                        
+                        # Clean up acknowledged packets
+                        for k in list(self.send_buffer.keys()):
+                            if k < self.send_base:
+                                del self.send_buffer[k]
+                        
                         if self.fin_sent and seq_num == self.next_seq_num - 1:
                             self.fin_acked = True
                         if self.send_base == self.next_seq_num:
                             self.all_data_acked = True
-                
-                elif packet_type == self.FIN_PACKET:
-                    # handle received FIN
-                    self.fin_received = True
-                    # send ACK for FIN
-                    for _ in range(5):  # send more ACKs for FIN
-                        hashed_val = self.compute_hash(seq_num, self.ACK_PACKET, b'')
-                        ack_packet = struct.pack(self.header_form, seq_num, self.ACK_PACKET, hashed_val)
-                        self.socket.sendto(ack_packet, (self.dst_ip, self.dst_port))
-
-                else: # unknown type, discard
-                    continue
-
-            except Exception as e:
-                if not self.closed:
-                    print("listener died!")
-                    print(e)
+                            
+                        # If window moved significantly, reset window size
+                        if self.send_base - old_base > 2:
+                            self.window_size = 5
+            finally:
+                pass
 
     def send(self, data_bytes: bytes) -> None:
-        """Note that data_bytes can be larger than one packet."""
-        # breaking the data into chunks and sending each chunk
         offset = 0
         while offset < len(data_bytes):
-            # get the next chunk of data
             max_data = self.max_size - self.header_size
             end = min(offset + max_data, len(data_bytes))
             chunk = data_bytes[offset:end]
             
-            # wait if window is full
-            while self.next_seq_num >= self.send_base + self.window_size: ##
-                self.handle_timeout() ##
-                time.sleep(0.01) ##
+            # More aggressive window management
+            retry_count = 0
+            while self.next_seq_num >= self.send_base + self.window_size:
+                self.handle_timeout()
+                time.sleep(0.01)
+                retry_count += 1
+                if retry_count > 100:  # If stuck too long
+                    # Force window movement
+                    self.send_base = self.next_seq_num - self.window_size + 1
+                    retry_count = 0
             
-            # send the packet
             hashed_val = self.compute_hash(self.next_seq_num, self.DATA_PACKET, chunk)
             header = struct.pack(self.header_form, self.next_seq_num, self.DATA_PACKET, hashed_val)
             segment = header + chunk
-            self.socket.sendto(segment, (self.dst_ip, self.dst_port))
-      
-            # store in send buffer and update sequence number
+            
+            # Send multiple times initially
+            for _ in range(3):
+                self.socket.sendto(segment, (self.dst_ip, self.dst_port))
+            
             self.send_buffer[self.next_seq_num] = segment
             self.next_seq_num += 1
             offset = end
             
-            # check for timeouts
-            self.handle_timeout()
+            # More frequent timeout checks
+            if self.next_seq_num % 2 == 0:
+                self.handle_timeout()
 
     def recv(self) -> bytes:
         while True:
